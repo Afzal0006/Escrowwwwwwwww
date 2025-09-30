@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import re
 import json
@@ -8,17 +9,26 @@ from telebot.types import Message
 # ---------- Config ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_IDS_ENV = os.getenv("OWNER_IDS", "")
-LOG_CHANNEL = os.getenv("LOG_CHANNEL")
+LOG_CHANNEL_ENV = os.getenv("LOG_CHANNEL", "")
 DATA_FILE = "data.json"
-FEE_PCT = 3.0
+FEE_PCT = 3.0  # percentage fee when using +fee variants
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN not set. Add it to environment/secrets.")
 
+# parse owners
 try:
     OWNERS = [int(x.strip()) for x in OWNER_IDS_ENV.split(",") if x.strip()]
-except:
+except Exception:
     OWNERS = []
+
+# parse log channel (allow numeric or @username)
+LOG_CHANNEL = None
+if LOG_CHANNEL_ENV:
+    try:
+        LOG_CHANNEL = int(LOG_CHANNEL_ENV)
+    except Exception:
+        LOG_CHANNEL = LOG_CHANNEL_ENV  # keep as string (e.g. @channelusername)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
@@ -27,18 +37,28 @@ def load_data():
     if not os.path.exists(DATA_FILE):
         return {"trades": {}, "admins": [], "next_id": 1}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except Exception:
+            # corrupted file -> reset
+            return {"trades": {}, "admins": [], "next_id": 1}
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DATA_FILE)
 
 data = load_data()
 trades = data.get("trades", {})
 admins = set(data.get("admins", []))
-next_id = int(data.get("next_id", 1))
+try:
+    next_id = int(data.get("next_id", 1))
+except Exception:
+    next_id = 1
 
 def persist():
+    global data
     data["trades"] = trades
     data["admins"] = list(admins)
     data["next_id"] = next_id
@@ -56,6 +76,14 @@ def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
 
 def parse_deal_form(text):
+    """
+    Extracts a deal form with fields:
+    BUYER: @username or text
+    SELLER: @username or text
+    DEAL AMOUNT: numeric (comma allowed)
+    DEAL INFO: optional rest of line
+    TIME TO DEAL: optional
+    """
     buyer = re.search(r"BUYER\s*[:\-]\s*(?P<b>@[A-Za-z0-9_]+|\w+)", text, re.IGNORECASE)
     seller = re.search(r"SELLER\s*[:\-]\s*(?P<s>@[A-Za-z0-9_]+|\w+)", text, re.IGNORECASE)
     amount = re.search(r"DEAL\s*AMOUNT\s*[:\-]\s*(?P<a>[\d\.,]+)", text, re.IGNORECASE)
@@ -69,7 +97,7 @@ def parse_deal_form(text):
         a = amount.group('a').replace(',', '').strip()
         try:
             res['amount'] = float(a)
-        except:
+        except Exception:
             res['amount'] = None
     else:
         res['amount'] = None
@@ -84,7 +112,7 @@ def is_admin(user_id):
     return user_id in admins or is_owner(user_id)
 
 # ---------- Commands ----------
-@bot.message_handler(commands=['start'])
+@bot.message_handler(commands=['start', 'help'])
 def cmd_start(m: Message):
     txt = (
         "👋 Welcome to Escrow Bot!\n\n"
@@ -109,7 +137,7 @@ def cmd_addadmin(m: Message):
         return
     try:
         uid = int(args[1])
-    except:
+    except Exception:
         bot.reply_to(m, "Invalid user id.")
         return
     admins.add(uid)
@@ -128,7 +156,7 @@ def cmd_removeadmin(m: Message):
         return
     try:
         uid = int(args[1])
-    except:
+    except Exception:
         bot.reply_to(m, "Invalid user id.")
         return
     if uid in admins:
@@ -138,7 +166,7 @@ def cmd_removeadmin(m: Message):
     else:
         bot.reply_to(m, "⚠️ This user is not an admin.")
 
-# ---- Modified handler to include refund+fee inside add ----
+# ---- Single handler for /add, /add+fee, and redirect for refund+fee ----
 @bot.message_handler(commands=['add', 'add+fee', 'refund+fee'])
 def cmd_add(m: Message):
     user_id = m.from_user.id
@@ -156,7 +184,7 @@ def cmd_add(m: Message):
 
     form = parse_deal_form(m.reply_to_message.text)
     if not form['buyer'] or not form['seller'] or form['amount'] is None:
-        bot.reply_to(m, "❌ Could not extract Buyer/Seller/Amount from the form. Make sure it's formatted.")
+        bot.reply_to(m, "❌ Could not extract Buyer/Seller/Amount from the form. Make sure it's formatted like:\n\nBUYER: @user\nSELLER: @user\nDEAL AMOUNT: 100\nDEAL INFO: ...")
         return
 
     use_fee = m.text.strip().lower().endswith('+fee')
@@ -176,7 +204,9 @@ def cmd_add(m: Message):
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "chat_id": m.chat.id,
-        "origin_message_id": m.reply_to_message.message_id
+        "origin_message_id": m.reply_to_message.message_id,
+        "info": form.get("info", ""),
+        "time_to_deal": form.get("time_to_deal", "")
     }
     trades[str(tid)] = trade
     persist()
@@ -199,6 +229,7 @@ def cmd_add(m: Message):
         try:
             bot.send_message(LOG_CHANNEL, f"📜 Payment Received (Log)\n{('-'*24)}\n{ text }")
         except Exception:
+            # don't fail bot if logging fails
             pass
 
 @bot.message_handler(commands=['done', 'done+fee'])
@@ -223,7 +254,7 @@ def cmd_done(m: Message):
 
     trade = trades[tid_str]
     use_fee = m.text.strip().lower().endswith('+fee')
-    if use_fee and trade.get('fee', 0) == 0:
+    if use_fee and float(trade.get('fee', 0)) == 0:
         trade['fee'] = round(trade['amount'] * (FEE_PCT/100.0), 2)
         trade['total'] = round(trade['amount'] + trade['fee'], 2)
     trade['status'] = 'completed'
@@ -247,7 +278,7 @@ def cmd_done(m: Message):
     if LOG_CHANNEL:
         try:
             bot.send_message(LOG_CHANNEL, f"📜 Deal Completed (Log)\n{('-'*24)}\n{ out }")
-        except:
+        except Exception:
             pass
 
 @bot.message_handler(commands=['refund', 'refund+fee'])
@@ -271,7 +302,7 @@ def cmd_refund(m: Message):
 
     trade = trades[tid_str]
     use_fee = m.text.strip().lower().endswith('+fee')
-    if use_fee and trade.get('fee', 0) == 0:
+    if use_fee and float(trade.get('fee', 0)) == 0:
         trade['fee'] = round(trade['amount'] * (FEE_PCT/100.0), 2)
         trade['total'] = round(trade['amount'] + trade['fee'], 2)
 
@@ -295,7 +326,7 @@ def cmd_refund(m: Message):
     if LOG_CHANNEL:
         try:
             bot.send_message(LOG_CHANNEL, f"📜 Refund Completed (Log)\n{('-'*24)}\n{ out }")
-        except:
+        except Exception:
             pass
 
 @bot.message_handler(commands=['stats'])
@@ -306,9 +337,11 @@ def cmd_stats(m: Message):
     for t in trades.values():
         if t.get('chat_id') == chat_id:
             total += 1
-            volume += float(t.get('amount',0) or 0)
-            if t.get('status') == 'completed': completed += 1
-            if t.get('status') == 'refunded': refunded += 1
+            volume += float(t.get('amount', 0) or 0)
+            if t.get('status') == 'completed':
+                completed += 1
+            if t.get('status') == 'refunded':
+                refunded += 1
     txt = (
         f"📊 Group Stats\n"
         f"Total Trades: {total}\n"
@@ -322,16 +355,16 @@ def cmd_stats(m: Message):
 def cmd_gstats(m: Message):
     agg = {}
     for t in trades.values():
-        adm = str(t.get('admin','unknown'))
+        adm = str(t.get('admin', 'unknown'))
         if adm not in agg:
-            agg[adm] = {"hold":0.0, "completed":0.0, "refunded":0.0, "count":0}
+            agg[adm] = {"hold": 0.0, "completed": 0.0, "refunded": 0.0, "count": 0}
         agg[adm]["count"] += 1
         if t.get('status') == 'open':
-            agg[adm]["hold"] += float(t.get('amount',0) or 0)
+            agg[adm]["hold"] += float(t.get('amount', 0) or 0)
         if t.get('status') == 'completed':
-            agg[adm]["completed"] += float(t.get('amount',0) or 0)
+            agg[adm]["completed"] += float(t.get('amount', 0) or 0)
         if t.get('status') == 'refunded':
-            agg[adm]["refunded"] += float(t.get('amount',0) or 0)
+            agg[adm]["refunded"] += float(t.get('amount', 0) or 0)
     lines = ["🌐 Global Stats (All time)"]
     for adm, v in agg.items():
         lines.append(f"\nEscrowed by : {adm}")
@@ -350,7 +383,7 @@ def cmd_mystats(m: Message):
     for t in trades.values():
         b = (t.get('buyer') or "").lower()
         s = (t.get('seller') or "").lower()
-        if (uname and uname.lower() in b) or (uname and uname.lower() in s):
+        if uname and uname.lower() in b or uname and uname.lower() in s:
             matches.append(t); continue
         if str(uid) in b or str(uid) in s:
             matches.append(t); continue
@@ -358,7 +391,7 @@ def cmd_mystats(m: Message):
         bot.reply_to(m, "ℹ️ Koi deals nahi mile aapke liye.")
         return
     parts = [f"📋 {len(matches)} deals found for {user.first_name}:"]
-    for t in sorted(matches, key=lambda x: x.get('created_at','')):
+    for t in sorted(matches, key=lambda x: x.get('created_at', '')):
         parts.append(
             f"\n🆔 #{t['id']}\nBuyer: {t['buyer']}\nSeller: {t['seller']}\nAmount: {t['amount']}\nStatus: {t['status']}\nCreated: {t['created_at']}\nUpdated: {t['updated_at']}"
         )
@@ -366,5 +399,19 @@ def cmd_mystats(m: Message):
 
 @bot.message_handler(func=lambda m: True, content_types=['text'])
 def fallback(m: Message):
+    # unknown command or plain text fallback
     if m.text and m.text.startswith('/'):
-        bot.reply_to(m, "Unknown command. Use /start to see available commands.
+        bot.reply_to(m, "Unknown command. Use /start to see available commands.")
+    else:
+        # for normal chat messages we don't respond (prevent spam)
+        return
+
+# ---------- Start bot ----------
+if __name__ == "__main__":
+    print("Bot started. Press Ctrl-C to stop.")
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except KeyboardInterrupt:
+        print("Stopping (keyboard).")
+    except Exception as e:
+        print("Polling stopped with exception:", e)
